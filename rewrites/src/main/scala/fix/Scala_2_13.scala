@@ -47,16 +47,16 @@ final class Scala_2_13 extends SemanticRule("Scala_2_13") {
     val globalImports = scala.collection.mutable.Set.empty[String]
     def addGlobalImport(importer: Importer) = {
       if (globalImports.add(importer.structure))
-        MyPatch.addGlobalImport(importer)
+        Patch.addGlobalImport(importer)
       else
-        MyPatch.empty
+        Patch.empty
     }
 
     def replaceToken(t: Tree, orig: String, repl: String) = {
       recordHandled(t)
       t.tokens.collect {
-        case t if t.text == orig => MyPatch.replaceToken(t, repl)
-      }.asMyPatch
+        case t if t.text == orig => Patch.replaceToken(t, repl)
+      }.asPatch.myWrap
     }
 
     def replaceTree(t: Tree, s: String) = {
@@ -68,25 +68,16 @@ final class Scala_2_13 extends SemanticRule("Scala_2_13") {
       replaceTree(tree, s"StdIn.$name") + addGlobalImport(importer"scala.io.StdIn")
     }
 
-    lazy val fixI: PartialFunction[Tree, MyPatch] = {
-      case Term.Interpolate(_, _, args) =>
-        args.collect(fixI).map {
-          case MyPatch.replaceTree(from: Term.Name, to)
-            if !to.startsWith("{") && !to.endsWith("}") && to.contains(".")
-          =>
-            MyPatch.replaceTree(from, s"{$to}")
-          case p => p
-        }.asMyPatch
-
-      case EOL(i: Importee)  => MyPatch.removeImportee(i)
+    val fix1: PartialFunction[Tree, MyPatch] = {
+      case EOL(i: Importee)  => Patch.removeImportee(i).myWrap
       case EOL(t: Term.Name) =>
         replaceTree(t, "EOL") + addGlobalImport(importer"java.lang.System.{lineSeparator => EOL}")
       case EOL(t: Term)      => replaceTree(t, "System.lineSeparator")
 
-      case currentTime(i: Importee) => MyPatch.removeImportee(i)
+      case currentTime(i: Importee) => Patch.removeImportee(i).myWrap
       case currentTime(t: Term)     => replaceTree(t, "System.currentTimeMillis")
 
-      case arraycopy(i: Importee)      => MyPatch.removeImportee(i)
+      case arraycopy(i: Importee)      => Patch.removeImportee(i).myWrap
       case arraycopy(Term.Apply(t, _)) => replaceTree(t, "System.arraycopy")
 
       case deprecatedConsoleReadBoolean(Term.Apply(t, _)) => stdInReplace(t, "readBoolean")
@@ -111,64 +102,63 @@ final class Scala_2_13 extends SemanticRule("Scala_2_13") {
 
       case t @ Lit.Symbol(sym) => MyPatch.replaceTree(t, s"""Symbol("${sym.name}")""")
     }
-    doc.tree.collect(new Combined({ case t if !handled(t) => t }, fixI)).asMyPatch.toPatch
+
+    val fixInterpolate: PartialFunction[Tree, Patch] = { case Term.Interpolate(_, _, args) =>
+      args.collect(fix1).map {
+        case MyPatch.replaceTree(from: Term.Name, to, extra)
+            if !to.startsWith("{") && !to.endsWith("}") && to.contains(".") =>
+          Patch.fromIterable(Patch.replaceTree(from, s"{$to}") +: extra)
+        case p => p.toPatch
+      }.asPatch
+    }
+    val fixAll = fix1.andThen(_.toPatch).orElse(fixInterpolate)
+    doc.tree.collect(PF.combine({ case t if !handled(t) => t }, fixAll)).asPatch
   }
 }
 
 private sealed abstract class MyPatch {
   import MyPatch._
 
-  def +(other: MyPatch): MyPatch =
-    if (this eq other) this
-    else if (this == empty) other
-    else if (other == empty) this
-    else Concat(this, other)
-
   def toPatch: Patch = this match {
-    case MyPatch.empty             => Patch.empty
-    case removeImportee(importee)  => Patch.removeImportee(importee)
-    case addGlobalImport(importee) => Patch.addGlobalImport(importee)
-    case replaceToken(from, to)    => Patch.replaceToken(from, to)
-    case replaceTree(from, to)     => Patch.replaceTree(from, to)
-    case Concat(a, b)              => a.toPatch + b.toPatch
+    case Wrap(patch)                  => patch
+    case replaceTree(from, to, extra) => Patch.fromIterable(Patch.replaceTree(from, to) +: extra)
   }
 }
 
 private object MyPatch {
-  case object empty extends MyPatch
-  final case class removeImportee(importee: Importee) extends MyPatch
-  final case class addGlobalImport(importer: Importer) extends MyPatch
-  final case class replaceToken(token: Token, toReplace: String) extends MyPatch
-  final case class replaceTree(from: Tree, to: String) extends MyPatch
-  final case class Concat(a: MyPatch, b: MyPatch) extends MyPatch
-
-  def fromIterable(seq: Iterable[MyPatch]): MyPatch = seq.foldLeft(empty: MyPatch)(_ + _)
+  final case class Wrap(patch: Patch) extends MyPatch
+  final case class replaceTree(from: Tree, to: String, extra: Seq[Patch] = Nil) extends MyPatch {
+    def +(p: Patch) = copy(extra = extra :+ p)
+  }
 
   object syntax {
-    implicit class IterableMyPatchSyntax(patches: Iterable[MyPatch]) {
-      def asMyPatch: MyPatch = MyPatch.fromIterable(patches)
+    implicit class PatchToMyPatch(patch: Patch) {
+      def myWrap: MyPatch = MyPatch.Wrap(patch)
     }
   }
 }
 
-private object Combined {
+private object PF {
   private[this] val mockDefaultFunc: Any => Any = _ => mockDefaultFunc
   private def mockDefaultFunction[B] = mockDefaultFunc.asInstanceOf[Any => B]
   private def fallbackOccurred[B](x: B) = mockDefaultFunc eq x.asInstanceOf[AnyRef]
-}
 
-private final class Combined[-A, B, +C] (pf: PartialFunction[A, B], k: PartialFunction[B, C]) extends PartialFunction[A, C] {
-  import Combined._
+  def combine[A, B, C](f: PartialFunction[A, B], g: PartialFunction[B, C]): Combined[A, B, C] =
+    new Combined(f, g)
 
-  def isDefinedAt(x: A): Boolean = {
-    val b = pf.applyOrElse(x, mockDefaultFunction)
-    !fallbackOccurred(b) || k.isDefinedAt(b)
-  }
+  final class Combined[-A, B, +C] (f: PartialFunction[A, B], g: PartialFunction[B, C])
+      extends PartialFunction[A, C] {
 
-  def apply(x: A): C = k(pf(x))
+    def isDefinedAt(x: A): Boolean = {
+      val b = f.applyOrElse(x, mockDefaultFunction)
+      !fallbackOccurred(b) || g.isDefinedAt(b)
+    }
 
-  override def applyOrElse[A1 <: A, C1 >: C](x: A1, default: A1 => C1): C1 = {
-    val pfv = pf.applyOrElse(x, mockDefaultFunction)
-    if (fallbackOccurred(pfv)) default(x) else k.applyOrElse(pfv, (_: B) => default(x))
+    def apply(x: A): C = g(f(x))
+
+    override def applyOrElse[A1 <: A, C1 >: C](x: A1, default: A1 => C1): C1 = {
+      val pfv = f.applyOrElse(x, mockDefaultFunction)
+      if (fallbackOccurred(pfv)) default(x) else g.applyOrElse(pfv, (_: B) => default(x))
+    }
   }
 }
