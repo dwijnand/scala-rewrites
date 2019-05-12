@@ -1,11 +1,12 @@
 package fix
 
 import scala.compat.Platform
+import java.lang.System.{lineSeparator => EOL}
 import scala.io.StdIn
 
 object Scala_2_13 {
-  def eol1 = "Hello World!" + System.lineSeparator
-  def eol2 = s"Hello World!${System.lineSeparator}"
+  def eol1 = "Hello World!" + EOL
+  def eol2 = s"Hello World!$EOL"
   def eol3 = "Hello World!" + System.lineSeparator
   def eol4 = s"Hello World!${System.lineSeparator}"
   def eol5 = "Hello World!" + System.lineSeparator
