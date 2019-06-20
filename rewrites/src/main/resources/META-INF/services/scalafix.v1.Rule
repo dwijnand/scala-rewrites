@@ -2,3 +2,8 @@ fix.scala213.Any2StringAdd
 fix.scala213.Core
 fix.scala213.ScalaSeq
 fix.scala213.Varargs
+
+scala.fix.collection.Collection213CrossCompat
+scala.fix.collection.Collection213Upgrade
+scala.fix.collection.Collection213Experimental
+scala.fix.collection.Collection213Roughly
